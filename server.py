@@ -109,7 +109,7 @@ def _parse_filename_session_id(filename: str) -> Optional[str]:
     return None
 
 
-def _build_session_index(history_dir: Path) -> List[Dict[str, Any]]:
+async def _build_session_index(history_dir: Path) -> List[Dict[str, Any]]:
     """Walk history_dir and return a list of session dicts sorted newest-first."""
     summaries: List[Dict[str, Any]] = []
     if not history_dir.is_dir():
@@ -118,7 +118,7 @@ def _build_session_index(history_dir: Path) -> List[Dict[str, Any]]:
     files = [f for f in history_dir.iterdir() if f.suffix == ".json"]
 
     for fp in files:
-        session = asyncio.run(_read_json_file_safe(fp))
+        session = await _read_json_file_safe(fp)
         if session is None:
             continue
         sid = _parse_filename_session_id(fp.name)
@@ -193,7 +193,7 @@ def _create_server() -> Server:
 
         if name == "list_cline_sessions":
             try:
-                result = _build_session_index(resolve_cline_history_dir())
+                result = await _build_session_index(resolve_cline_history_dir())
                 return CallToolResult(
                     content=[
                         TextContent(
@@ -366,7 +366,7 @@ def _create_server() -> Server:
         uri = params.uri  # type: ignore[union-attr]
 
         if uri == "cline://sessions":
-            result = _build_session_index(resolve_cline_history_dir())
+            result = await _build_session_index(resolve_cline_history_dir())
             return [TextContent(
                 type="text",
                 text=json.dumps(result, indent=2)
