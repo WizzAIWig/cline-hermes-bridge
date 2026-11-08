@@ -7,11 +7,11 @@ Hermes Agent to monitor and manage Cline CLI workers.
 
 Uses the mcp 2.x low-level API (callback-based handler registration).
 """
-
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import platform
 import re
@@ -20,9 +20,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from mcp.server.lowlevel.server import Server
 import mcp.server.stdio
-from mcp.types import CallToolResult, TextContent
+from mcp.server.lowlevel.server import Server
+import mcp_types as mcp_types_module
+from mcp.types import CallToolResult, TextContent, TextResourceContents
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger(__name__)
+_logger.addHandler(logging.StreamHandler())
+_logger.setLevel(logging.DEBUG)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Max trailing characters to retain from stdout/stderr buffers.
+STDOUT_BUFFER_MAX = 2048
+# Maximum allowed prompt length (characters).
+PROMPT_MAX_LENGTH = 4096
+# Grace period before escalating SIGTERM → SIGKILL (seconds).
+KILL_GRACE_PERIOD = 0.5
+# Maximum retry attempts for spawning Cline CLI.
+MAX_CLINE_RETRIES = 3
+
 
 # ---------------------------------------------------------------------------
 # Subprocess / stdio helpers
@@ -31,9 +54,10 @@ from mcp.types import CallToolResult, TextContent
 
 async def _read_json_file_safe(path: Path) -> Optional[dict]:
     """Asynchronously read a JSON file, returning None on I/O or parse errors."""
-    loop = asyncio.get_event_loop()
     try:
-        text = await loop.run_in_executor(None, path.read_text, "utf-8")
+        text = await asyncio.get_running_loop().run_in_executor(
+            None, path.read_text, "utf-8"
+        )
         return json.loads(text)
     except (json.JSONDecodeError, OSError, ValueError):
         return None
@@ -91,309 +115,220 @@ def _parse_filename_session_id(filename: str) -> Optional[str]:
     name = Path(filename).stem
     for pattern in [
         r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        r"^session_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
-        r"^chat_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+        r"^session_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        r"^chat_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     ]:
-        m = re.match(pattern, name, re.IGNORECASE)
+        m = re.match(pattern, name)
         if m:
-            return m.group(1) if m.lastindex else name
+            return m.group(1) if m.lastindex else m.group(0)
+    # Fallback: use filename without extension as session ID.
+    if re.match(r"^[0-9a-fA-F]+$", name):
+        return name
     return None
 
 
-async def _build_session_index(history_dir: Path) -> List[Dict[str, Any]]:
-    """Walk Cline CLI session directories and return session summaries sorted newest-first.
-
-    Each session is a directory (e.g. ``1794141752666_nnmuu``) containing
-    ``<session_id>.json`` (metadata) and ``<session_id>.messages.json`` (chat log).
-    """
-    summaries: List[Dict[str, Any]] = []
-    if not history_dir.is_dir():
-        return summaries
-
-    # Each session is a directory; metadata is <session_id>.json inside it.
-    for session_dir in sorted(history_dir.iterdir(), reverse=True):
-        if not session_dir.is_dir():
-            continue
-        meta_path = session_dir / f"{session_dir.name}.json"
-        if not meta_path.is_file():
-            continue
-
-        session = await _read_json_file_safe(meta_path)
-        if session is None:
-            continue
-
-        sid = session.get("session_id", session_dir.name)
-        if not sid:
-            sid = session_dir.name
-
-        created_at = session.get("started_at", "")
-        if not created_at:
-            created_at = session.get("ended_at", "")
-
-        prompt = session.get("prompt", "")
-        if isinstance(prompt, str):
-            prompt = prompt.strip()[:200]
-        else:
-            prompt = ""
-
-        status = session.get("status", "unknown")
-        interactive = session.get("interactive", False)
-        pid = session.get("pid")
-
-        summaries.append({
-            "session_id": sid,
-            "initial_task": prompt,
-            "created_at": str(created_at),
-            "status": status,
-            "interactive": interactive,
-            "pid": pid,
-        })
-
-    return summaries
+def _parse_session_file_datetime(filename: str) -> datetime:
+    """Return last-modified time as a fallback 'created_at' timestamp."""
+    return datetime.fromtimestamp(
+        Path(filename).stat().st_mtime, tz=timezone.utc
+    )
 
 
 # ---------------------------------------------------------------------------
-# Runtime-process tracker
+# Runtime state
 # ---------------------------------------------------------------------------
 
+# Maps tracked PIDs to their runtime metadata.
 _RUNTIME: Dict[int, Dict[str, Any]] = {}
 _RUNTIME_LOCK = asyncio.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Internal time helper (UTC epoch seconds)
+# ---------------------------------------------------------------------------
+
 def _now() -> float:
+    """Current UTC timestamp as a float."""
     return time.time()
 
 
 # ---------------------------------------------------------------------------
-# MCP Server instance & handler registration
+# Server factory
 # ---------------------------------------------------------------------------
 
+
 def _create_server() -> Server:
-    """Create and fully configure the MCP server instance.
+    """Build the MCP server and attach all tool / resource handlers.
 
-    Uses the mcp 2.x low-level API where callbacks are passed to
-    Server.__init__ and invoked as handler(context, params).
+    Uses the MCP 2.x constructor-based API: callbacks are passed as named
+    keyword arguments (on_call_tool, on_list_tools, on_list_resources,
+    on_read_resource) and invoked by the runner.
     """
-
     # ---- Tool callbacks ----
 
-    async def _on_call_tool(context, params) -> CallToolResult:
-        """Handle tool call requests.
-
-        params is a CallToolRequestParams with .name (str) and
-        .arguments (dict or None).
-        """
-        name = params.name
-        arguments = params.arguments or {}
-
+    async def _on_call_tool(
+        name: str, arguments: Optional[dict]
+    ) -> CallToolResult:
         if name == "list_cline_sessions":
-            try:
-                result = await _build_session_index(resolve_cline_history_dir())
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=json.dumps(result, indent=2)
-                        )
-                    ]
-                )
-            except Exception as exc:
-                return CallToolResult(
-                    content=[TextContent(
-                        type="text",
-                        text=json.dumps({"error": str(exc)})
-                    )],
-                    is_error=True
-                )
+            return await _get_session_list()
 
         if name == "command_cline_agent":
-            prompt: str = arguments.get("prompt", "")
-            resume_id: Optional[str] = arguments.get("resume_session_id")
-            if not prompt:
-                return CallToolResult(
-                    content=[TextContent(
-                        type="text",
-                        text=json.dumps({
-                            "error": "Parameter 'prompt' is required."
-                        })
-                    )],
-                    is_error=True
-                )
-
-            try:
-                pid = await _spawn_cline_task(prompt, resume_id)
-            except RuntimeError as exc:
-                return CallToolResult(
-                    content=[TextContent(
-                        type="text",
-                        text=json.dumps({"error": str(exc)})
-                    )],
-                    is_error=True
-                )
-
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps({
-                            "pid": pid,
-                            "status": "spawning",
-                            "prompt_length": len(prompt)
-                        })
-                    )
-                ]
+            return await _spawn_cline_task(
+                prompt=arguments["prompt"] if arguments else "",
+                resume_session_id=(
+                    arguments.get("resume_session_id", "")
+                    if arguments
+                    else ""
+                ),
             )
 
         if name == "get_agent_runtime_status":
-            pid: int = int(arguments.get("pid", 0))
+            pid = int(arguments.get("pid", 0)) if arguments else 0
             return await _query_runtime_status(pid)
 
         if name == "stop_cline_agent":
-            pid: int = int(arguments.get("pid", 0))
+            pid = int(arguments.get("pid", 0)) if arguments else 0
             return await _kill_cline_task(pid)
 
         return CallToolResult(
             content=[TextContent(
                 type="text",
-                text=json.dumps({"error": f"Unknown tool: {name}"})
+                text=json.dumps({
+                    "error": f"Unknown tool: {name}"
+                }, indent=2)
             )],
             is_error=True
         )
 
-    async def _on_list_tools(context, params) -> List[Dict[str, Any]]:
+    async def _on_list_tools() -> List[mcp_types_module.Tool]:
         """Return the tool list that Cline will expose to clients."""
         return [
-            {
-                "name": "list_cline_sessions",
-                "title": "list_cline_sessions",
-                "description": (
-                    "List all local Cline CLI sessions sorted by newest first. "
-                    "Returns session metadata including initial prompt, status, and PID."
+            mcp_types_module.Tool(
+                name="list_cline_sessions",
+                description=(
+                    "List all Cline CLI sessions sorted newest first. "
+                    "Returns session metadata including initial task, status, "
+                    "created_at, and process ID."
                 ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            },
-            {
-                "name": "command_cline_agent",
-                "title": "command_cline_agent",
-                "description": (
-                    "Start a new Cline CLI task or resume an existing one "
-                    "asynchronously. Returns the PID for status tracking."
+                input_schema={"type": "object", "properties": {}},
+            ),
+            mcp_types_module.Tool(
+                name="command_cline_agent",
+                description=(
+                    "Start a new Cline CLI session or resume an existing one "
+                    "by its session ID. Returns the new process PID and status."
                 ),
-                "inputSchema": {
+                input_schema={
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
                             "description": (
-                                "The prompt or instructions to pass to Cline."
-                            )
+                                "The task prompt for Cline CLI. "
+                                "Mandatory – must be a non-empty string."
+                            ),
                         },
                         "resume_session_id": {
                             "type": "string",
                             "description": (
-                                "Optional session ID to resume. If provided, "
-                                "the task will continue that session."
-                            )
-                        }
+                                "Optional session ID to resume. "
+                                "When omitted a fresh session is created."
+                            ),
+                        },
                     },
-                    "required": ["prompt"]
-                }
-            },
-            {
-                "name": "get_agent_runtime_status",
-                "title": "get_agent_runtime_status",
-                "description": (
-                    "Check whether a specific Cline CLI task is active, "
-                    "stalled, or finished. Returns process life status, "
-                    "runtime, and stdout/stderr fragments."
+                    "required": ["prompt"],
+                },
+            ),
+            mcp_types_module.Tool(
+                name="get_agent_runtime_status",
+                description=(
+                    "Check whether a tracked Cline CLI process is still "
+                    "alive. Returns the PID, alive flag, start time, "
+                    "runtime duration, and stdout/stderr excerpts."
                 ),
-                "inputSchema": {
+                input_schema={
                     "type": "object",
                     "properties": {
                         "pid": {
                             "type": "integer",
-                            "description": (
-                                "The process ID returned by command_cline_agent."
-                            )
-                        }
+                            "description": "PID as returned by command_cline_agent.",
+                        },
                     },
-                    "required": ["pid"]
-                }
-            },
-            {
-                "name": "stop_cline_agent",
-                "title": "stop_cline_agent",
-                "description": (
-                    "Forcefully terminate a running Cline subprocess. "
-                    "Sends SIGTERM, escalates to SIGKILL if unresponsive."
+                    "required": ["pid"],
+                },
+            ),
+            mcp_types_module.Tool(
+                name="stop_cline_agent",
+                description=(
+                    "Terminate a running Cline CLI subprocess via the "
+                    "kill command. Sends SIGTERM and escalates to SIGKILL "
+                    "after a brief grace period if needed."
                 ),
-                "inputSchema": {
+                input_schema={
                     "type": "object",
                     "properties": {
                         "pid": {
                             "type": "integer",
-                            "description": "The process ID to terminate."
-                        }
+                            "description": "PID of the process to terminate.",
+                        },
                     },
-                    "required": ["pid"]
-                }
-            }
+                    "required": ["pid"],
+                },
+            ),
         ]
 
-    async def _on_list_resources(context, params) -> List[Dict[str, Any]]:
+    async def _on_list_resources() -> List[Dict[str, Any]]:
         return [
             {
-                "uri": "cline://sessions",
-                "name": "cline://sessions",
-                "description": "List of all Cline session URIs."
-            }
+                "uri": "cline://agent/status",
+                "name": "Agent Runtime Status",
+                "description": "Current status of all tracked Cline CLI processes.",
+                "mimeType": "application/json",
+            },
+            {
+                "uri": "cline://sessions/{id}/chat",
+                "name": "Cline Session Chat Log",
+                "description": "Chat log for a specific Cline CLI session.",
+                "mimeType": "application/json",
+            },
         ]
 
-    async def _on_read_resource(context, params) -> List[Any]:
-        """Handle resource read requests.
+    async def _on_read_resource(uri: str) -> Dict[str, Any]:
+        """Handle resource reads for Cline session data and aggregate status."""
+        # --- cline://agent/status ---
+        uri_stripped = uri.rstrip("/")
+        if uri_stripped in ("cline://agent/status", "cline://agent/status/"):
+            return {"contents": [TextResourceContents(uri="cline://agent/status", mime_type="application/json", text=json.dumps(_aggregate_status(), indent=2))]}
 
-        params is a ReadResourceRequestParams with attribute .uri.
-        """
-        uri = params.uri
-
-        if uri == "cline://sessions":
-            result = await _build_session_index(resolve_cline_history_dir())
-            return [TextContent(
-                type="text",
-                text=json.dumps(result, indent=2)
-            )]
-
+        # --- cline://sessions/{id}/chat ---
         m = re.match(r"cline://sessions/([^/]+)/chat", uri)
         if m:
             session_id = m.group(1)
-            history = resolve_cline_history_dir()
+            history_dir = resolve_cline_history_dir()
+            session_dir = history_dir / session_id
+            chat_path = session_dir / f"{session_id}.messages.json"
 
-            # The CLI stores each session in a directory:
-            # ~/.cline/data/sessions/<session_id>/<session_id>.messages.json
-            session = await _read_json_file_safe(
-                history / session_id / f"{session_id}.messages.json"
-            )
-            if session is None:
-                return [TextContent(
-                    type="text",
-                    text=json.dumps({
-                        "error": f"No session found with id '{session_id}'"
-                    })
-                )]
+            # Fallback: try with session_id as directory name
+            if not chat_path.exists():
+                alt_path = history_dir / f"{session_id}.messages.json"
+                if alt_path.exists():
+                    chat_path = alt_path
 
-            messages = session if isinstance(session, list) else session.get("messages", [])
-            chat_log: List[Dict[str, str]] = []
+            chat_data = await _read_json_file_safe(chat_path)
+            if chat_data is None:
+                return {"contents": [TextResourceContents(uri=f"cline://sessions/{session_id}/chat", mime_type="application/json", text=json.dumps({
+                        "error": f"Chat log not found for session {session_id}"
+                    }))]}
+
+            chat_log: List[Dict[str, Any]] = []
+            messages = chat_data.get("messages", chat_data.get("history", []))
             for msg in messages:
                 role = msg.get("role", "unknown")
                 content = msg.get("content", "")
                 if isinstance(content, str) and content.strip():
                     chat_log.append({
                         "role": role,
-                        "text": content.strip()[:4096]
+                        "text": content.strip()[:4096],
                     })
                 elif isinstance(content, list):
                     for item in content:
@@ -402,48 +337,22 @@ def _create_server() -> Server:
                             if txt and txt.strip():
                                 chat_log.append({
                                     "role": role,
-                                    "text": txt.strip()[:4096]
+                                    "text": txt.strip()[:4096],
                                 })
 
-            return [TextContent(
-                type="text",
-                text=json.dumps(
-                    {
-                        "session_id": session_id,
-                        "messages": chat_log
-                    },
-                    indent=2
-                )
-            )]
+            return {"contents": [TextResourceContents(uri=f"cline://sessions/{session_id}/chat", mime_type="application/json", text=json.dumps({
+                    "session_id": session_id,
+                    "total_messages": len(messages),
+                    "chat_log": chat_log
+                }, indent=2))]}
 
-        if uri == "cline://agent/status":
-            active = []
-            async with _RUNTIME_LOCK:
-                for entry in _RUNTIME.values():
-                    if entry.get("alive"):
-                        active.append(entry["pid"])
-            status = "RUNNING" if active else "IDLE"
-            return [TextContent(
-                type="text",
-                text=json.dumps({
-                    "status": status,
-                    "active_processes": len(active),
-                    "pids": active
-                })
-            )]
-
+        # --- Unknown URI ---
         raise ValueError(f"Unknown resource URI: {uri}")
 
     # ---- Build server ----
 
     srv = Server(
         name="cline-hermes-bridge",
-        version="1.0.0",
-        description=(
-            "MCP bridge exposing Cline CLI session history and process "
-            "control. Allows Hermes Agent to monitor and manage Cline "
-            "CLI workers."
-        ),
         on_list_tools=_on_list_tools,
         on_call_tool=_on_call_tool,
         on_list_resources=_on_list_resources,
@@ -454,75 +363,279 @@ def _create_server() -> Server:
 
 
 # ---------------------------------------------------------------------------
-# Async subprocess helpers
+# Session resolution helper
 # ---------------------------------------------------------------------------
 
 
-async def _collect_stream(
-    stream: asyncio.StreamReader,
-    entry: Dict[str, Any],
-    label: str,
-) -> None:
-    """Read stdout/stderr lines and accumulate into entry buffers."""
-    try:
-        async for line in iter(stream.readline, b""):
-            text = line.decode("utf-8", errors="replace").rstrip()
-            key = f"{label}_buf"
-            existing = entry.get(key, "")
-            entry[key] = (existing + text + "\n")[-2048:]
-    except Exception:
-        pass
+async def _resolve_session_file(
+    history_dir: Path, session_id: str
+) -> Optional[Path]:
+    """Locate a session metadata file by exact match or filename prefix."""
+    # Exact match
+    candidate = history_dir / f"{session_id}.json"
+    if candidate.exists():
+        return candidate
+
+    # Prefix match: strip common prefixes
+    clean = re.sub(r"^(session_|chat_)", "", session_id)
+    candidate = history_dir / f"{clean}.json"
+    if candidate.exists():
+        return candidate
+
+    return None
 
 
-async def _poll_liveness(
-    proc: asyncio.subprocess.Process,
-    entry: Dict[str, Any],
-) -> None:
-    """Keep entry alive while process runs; mark finished when done."""
-    await proc.wait()
-    entry["alive"] = False
-    entry["return_code"] = proc.returncode
+# ---------------------------------------------------------------------------
+# Tool: list_cline_sessions
+# ---------------------------------------------------------------------------
+
+
+async def _get_session_list() -> CallToolResult:
+    """Build a sorted list of all Cline CLI sessions with metadata."""
+
+    history_dir = resolve_cline_history_dir()
+    if not history_dir.is_dir():
+        _logger.warning("Cline history directory not found: %s", history_dir)
+        return CallToolResult(
+            content=[TextContent(
+                type="text",
+                text=json.dumps([], indent=2)
+            )]
+        )
+
+    sessions: List[dict] = []
+
+    # Index active PIDs for enrichment.
+    async with _RUNTIME_LOCK:
+        pid_to_session: Dict[int, str] = {
+            info["pid"]: sid for sid, info in _RUNTIME.items()
+            if info.get("pid")
+        }
+
+    for entry in sorted(
+        history_dir.iterdir(),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        if not entry.is_dir():
+            continue
+        metadata = await _read_json_file_safe(entry / f"{entry.name}.json")
+        if metadata is None:
+            metadata = await _read_json_file_safe(entry / f"{entry.name}/metadata.json")
+            if metadata is None:
+                continue
+
+        sid = metadata.get("session_id", entry.name)
+        initial_task = metadata.get("prompt", metadata.get("initial_task", ""))
+        # _extract_initial_task is kept for backward compat but is not
+        # used for the main listing (prompt field is used directly).
+        status = metadata.get("status", "unknown")
+        interactive = metadata.get("interactive", False)
+
+        # Try to find a matching running PID.
+        pid: Optional[int] = None
+        for _pid, info in pid_to_session.items():
+            if info.get("session_id") == sid:
+                pid = _pid
+                break
+
+        sessions.append({
+            "session_id": sid,
+            "initial_task": initial_task[:200],
+            "created_at": _parse_session_file_datetime(entry.name).isoformat(),
+            "status": status,
+            "interactive": interactive,
+            "pid": pid,
+        })
+
+    return CallToolResult(
+        content=[TextContent(
+            type="text",
+            text=json.dumps(sessions, indent=2)
+        )]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: command_cline_agent (spawn / resume)
+# ---------------------------------------------------------------------------
 
 
 async def _spawn_cline_task(
     prompt: str,
-    resume_session_id: Optional[str] = None,
-) -> int:
-    """Spawn a Cline CLI task and track its PID.
+    resume_session_id: str = "",
+) -> CallToolResult:
+    """Create a new Cline CLI session or resume an existing one."""
 
-    Non-interactive CLI usage:
-      cline "prompt"            start a new session
-      cline --id <sid> "prompt" resume a session
-    """
+    if not prompt:
+        return CallToolResult(
+            content=[TextContent(
+                type="text",
+                text=json.dumps({
+                    "error": "Parameter 'prompt' is required."
+                })
+            )],
+            is_error=True
+        )
+
+    if len(prompt) > PROMPT_MAX_LENGTH:
+        return CallToolResult(
+            content=[TextContent(
+                type="text",
+                text=json.dumps({
+                    "error": f"Prompt exceeds maximum length of {PROMPT_MAX_LENGTH} characters."
+                })
+            )],
+            is_error=True
+        )
+
+    pid = os.getpid()  # Placeholder — overwritten below
+
+    # Validate resume_session_id if provided
+    if resume_session_id:
+        if len(resume_session_id) > PROMPT_MAX_LENGTH:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "error": "Session ID exceeds maximum length."
+                    })
+                )],
+                is_error=True
+            )
+
+    # Verify Cline CLI is available before spawning
+    proc = await asyncio.create_subprocess_exec(
+        "cline", "--help",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.wait()
+    if proc.returncode != 0:
+        pid = os.getpid()  # Still assign a value for the response
+        return CallToolResult(
+            content=[TextContent(
+                type="text",
+                text=json.dumps({
+                    "pid": pid,
+                    "status": "error",
+                    "error": "cline CLI not found in PATH. Install with: npm install -g @anthropic/cline"
+                })
+            )],
+            is_error=True
+        )
+
+    # Build command
     if resume_session_id:
         cmd = ["cline", "--id", resume_session_id, prompt]
     else:
         cmd = ["cline", prompt]
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    # Track across retries
+    last_error: Optional[Exception] = None
+    for attempt in range(MAX_CLINE_RETRIES):
+        try:
+            _logger.debug("Attempt %d: spawning cline with cmd: %s", attempt + 1, cmd)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            pid = proc.pid
+            break
+        except Exception as exc:
+            last_error = exc
+            _logger.warning(
+                "Attempt %d failed: %s", attempt + 1, exc
+            )
+            await asyncio.sleep(1)
+
+    else:
+        if last_error:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "error": f"Failed to start Cline CLI after {MAX_CLINE_RETRIES} attempts: {last_error}"
+                    })
+                )],
+                is_error=True
+            )
+        return CallToolResult(
+            content=[TextContent(
+                type="text",
+                text=json.dumps({
+                    "error": "Failed to start Cline CLI"
+                })
+            )],
+            is_error=True
+        )
+
+    # Collect streams and detect process exit.
+    async def _collect_streams() -> None:
+        """Read stdout/stderr, update buffer, and mark process finished."""
+        await asyncio.gather(
+            _read_stream(proc.stdout, "stdout_buf"),
+            _read_stream(proc.stderr, "stderr_buf"),
+        )
+        async with _RUNTIME_LOCK:
+            entry = _RUNTIME.get(pid)
+            if entry:
+                entry["alive"] = False
+                entry["return_code"] = proc.returncode
+
+    async def _read_stream(stream: asyncio.StreamReader, buf_key: str) -> None:
+        """Read one stream to EOF, appending to the buffer."""
+        while True:
+            try:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace")
+                async with _RUNTIME_LOCK:
+                    entry = _RUNTIME.get(pid)
+                    if entry:
+                        buf = entry.get(buf_key, "") or ""
+                        entry[buf_key] = (buf + text)[-STDOUT_BUFFER_MAX:]
+            except (asyncio.CancelledError, GeneratorExit):
+                break
+            except Exception:
+                break
+
+    # Register the process immediately so status queries don't show "not tracked"
+    async with _RUNTIME_LOCK:
+        _RUNTIME[pid] = {
+            "pid": pid,
+            "alive": True,
+            "started_at": _now(),
+            "stdout_buf": "",
+            "stderr_buf": "",
+            "prompt": prompt[:200],
+            "return_code": None,
+        }
+
+    asyncio.create_task(_collect_streams())
+
+    return CallToolResult(
+        content=[TextContent(
+            type="text",
+            text=json.dumps({
+                "pid": pid,
+                "status": "spawning",
+                "prompt_length": len(prompt)
+            }, indent=2)
+        )]
     )
 
-    entry = {
-        "pid": proc.pid,
-        "started_at": _now(),
-        "alive": True,
-        "stdout_buf": "",
-        "stderr_buf": "",
-        "return_code": None,
-        "prompt": prompt,
-        "resume_session_id": resume_session_id,
-    }
-    async with _RUNTIME_LOCK:
-        _RUNTIME[proc.pid] = entry
 
-    asyncio.ensure_future(_collect_stream(proc.stdout, entry, "stdout"))
-    asyncio.ensure_future(_collect_stream(proc.stderr, entry, "stderr"))
-    asyncio.ensure_future(_poll_liveness(proc, entry))
+# ---------------------------------------------------------------------------
+# Poll liveness — background task for completed processes
+# ---------------------------------------------------------------------------
 
-    return proc.pid
+
+async def _poll_liveness(pid: int) -> None:
+    """Check process liveness asynchronously. This is a no-op placeholder."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +645,11 @@ async def _spawn_cline_task(
 
 async def _query_runtime_status(pid: int) -> CallToolResult:
     """Query the runtime status of a tracked Cline process."""
-    if pid not in _RUNTIME:
+
+    async with _RUNTIME_LOCK:
+        entry = _RUNTIME.get(pid)
+
+    if entry is None:
         return CallToolResult(
             content=[TextContent(
                 type="text",
@@ -541,17 +658,17 @@ async def _query_runtime_status(pid: int) -> CallToolResult:
                     "alive": False,
                     "error": "Process not tracked"
                 }, indent=2)
-            )]
+            )],
+            is_error=True
         )
 
-    entry = _RUNTIME[pid]
     rt: Dict[str, Any] = {
         "pid": pid,
-        "alive": entry["alive"],
+        "alive": entry.get("alive", False),
         "started_at": datetime.fromtimestamp(
-            entry["started_at"], tz=timezone.utc
-        ).isoformat(),
-        "runtime_seconds": round(_now() - entry["started_at"], 1),
+            entry.get("started_at", 0), tz=timezone.utc
+        ).isoformat() if entry.get("started_at") else None,
+        "runtime_seconds": round(_now() - entry.get("started_at", _now()), 1) if entry.get("started_at") else 0,
         "stdout_excerpt": entry.get("stdout_buf", "")[-1024:] or "",
         "stderr_excerpt": entry.get("stderr_buf", "")[-1024:] or "",
         "return_code": entry.get("return_code"),
@@ -567,25 +684,31 @@ async def _query_runtime_status(pid: int) -> CallToolResult:
 async def _kill_cline_task(pid: int) -> CallToolResult:
     """Kill a process via kill command; escalate to SIGKILL if SIGTERM fails."""
     try:
-        proc = await asyncio.create_subprocess_exec(
+        term_proc = await asyncio.create_subprocess_exec(
             "kill", "-TERM", str(pid),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await proc.wait()
+        await term_proc.wait()
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(KILL_GRACE_PERIOD)
+
+        # Re-check liveness after grace period; escalate if still alive.
+        still_alive = False
+        async with _RUNTIME_LOCK:
+            entry = _RUNTIME.get(pid)
+            still_alive = entry and entry.get("alive")
+
+        if still_alive:
+            kill_proc = await asyncio.create_subprocess_exec(
+                "kill", "-KILL", str(pid),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await kill_proc.wait()
 
         async with _RUNTIME_LOCK:
             entry = _RUNTIME.get(pid)
-            if entry and entry.get("alive"):
-                await asyncio.create_subprocess_exec(
-                    "kill", "-KILL", str(pid),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                if entry:
-                    entry["alive"] = False
             if entry:
                 entry["alive"] = False
 
@@ -614,8 +737,101 @@ async def _kill_cline_task(pid: int) -> CallToolResult:
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Resource handlers
 # ---------------------------------------------------------------------------
+
+
+async def _on_read_resource(uri: str) -> dict:
+    """Handle resource reads for Cline session data and aggregate status."""
+    # --- cline://agent/status ---
+    uri_stripped = uri.rstrip("/")
+    if uri_stripped in ("cline://agent/status", "cline://agent/status/"):
+        return {"contents": [TextResourceContents(uri="cline://agent/status", mime_type="application/json", text=json.dumps(_aggregate_status(), indent=2))]}
+
+    # --- cline://sessions/{id}/chat ---
+    m = re.match(r"cline://sessions/([^/]+)/chat", uri)
+    if m:
+        session_id = m.group(1)
+        history_dir = resolve_cline_history_dir()
+        session_dir = history_dir / session_id
+        chat_path = session_dir / f"{session_id}.messages.json"
+
+        # Fallback: try with session_id as directory name
+        if not chat_path.exists():
+            alt_path = history_dir / f"{session_id}.messages.json"
+            if alt_path.exists():
+                chat_path = alt_path
+
+        chat_data = await _read_json_file_safe(chat_path)
+        if chat_data is None:
+            return {"contents": [TextResourceContents(uri=f"cline://sessions/{session_id}/chat", mime_type="application/json", text=json.dumps({
+                    "error": f"Chat log not found for session {session_id}"
+                }))]}
+
+        chat_log: List[Dict[str, Any]] = []
+        messages = chat_data.get("messages", chat_data.get("history", []))
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.strip():
+                chat_log.append({
+                    "role": role,
+                    "text": content.strip()[:4096],
+                })
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        txt = item.get("text", "")
+                        if txt and txt.strip():
+                            chat_log.append({
+                                "role": role,
+                                "text": txt.strip()[:4096],
+                            })
+
+        return {"contents": [TextResourceContents(uri=f"cline://sessions/{session_id}/chat", mime_type="application/json", text=json.dumps({
+                "session_id": session_id,
+                "total_messages": len(messages),
+                "chat_log": chat_log
+            }, indent=2))]}
+
+    # --- Unknown URI ---
+    raise ValueError(f"Unknown resource URI: {uri}")
+
+
+# ---------------------------------------------------------------------------
+# Aggregate status
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_status() -> Dict[str, Any]:
+    """Compute aggregate status from active runtime entries."""
+    return {
+        "total_sessions": len(_RUNTIME),
+        "active_processes": sum(
+            1 for info in _RUNTIME.values() if info.get("alive")
+        ),
+        "total_stdout_bytes": sum(
+            len(info.get("stdout_buf", "")) for info in _RUNTIME.values()
+        ),
+        "total_stderr_bytes": sum(
+            len(info.get("stderr_buf", "")) for info in _RUNTIME.values()
+        ),
+        "sessions": {
+            str(pid): {
+                "alive": info.get("alive"),
+                "runtime_seconds": round(
+                    _now() - info.get("started_at", 0), 1
+                ),
+            }
+            for pid, info in _RUNTIME.items()
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 
 async def run_server() -> None:
     """Entry-point: run the MCP server over stdio."""
