@@ -11,7 +11,7 @@
 
 - [Architecture](#architecture)
 - [Installation](#installation)
-- [OS-Specific Path Configuration](#os-specific-path-configuration)
+- [Cline CLI Path Configuration](#cline-cli-path-configuration)
 - [Running the Server](#running-the-server)
 - [MCP Resources (Read-Only Monitoring)](#mcp-resources--read-only-monitoring)
 - [MCP Tools (Process Control)](#mcp-tools--process-control)
@@ -45,9 +45,8 @@ communication channel entirely non-blocking.
 ### Prerequisites
 
 - **Python 3.10+**
-- **Node.js** and the global `cline` CLI package (`@anthropic/cline` or equivalent)
+- **Node.js** and the global `cline` CLI package
   - Install with: `npm install -g @anthropic/cline`
-- VS Code installed (for Cline session history access)
 
 ### Setup
 
@@ -60,20 +59,24 @@ pip install -r requirements.txt
 
 ---
 
-## OS-Specific Path Configuration
+## Cline CLI Path Configuration
 
-The server auto-detects the host operating system and resolves Cline's session history
-directory. The resolved paths are:
+The server auto-detects the host operating system and resolves Cline CLI's session history
+directory:
 
-| OS    | Environment Variable  | Path Pattern |
-|-------|-----------------------|------------------------------------|
-| macOS | `HOME`                | `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/history/` |
-| Windows | `APPDATA`         | `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\history\` |
-| Linux | `HOME`                | `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/history/` |
+| OS    | Session Directory                                    |
+|-------|------------------------------------------------------|
+| macOS | `~/.cline/data/sessions/`                            |
+| Windows | `%APPDATA%\.cline\data\sessions\`                  |
+| Linux | `~/.cline/data/sessions/`                            |
 
-> **Override:** If your VS Code or Cline install uses a non-default user data directory, set
+> **Override:** If your Cline CLI install uses a non-default sessions directory, set
 > the environment variable `CLINE_HISTORY_DIR` to point to the correct path. The server
 > will use that value instead of the auto-detected path.
+
+Each session directory contains two files:
+- `<session_id>.json` — session metadata (prompt, status, PID, etc.)
+- `<session_id>.messages.json` — full chat log with all messages
 
 ---
 
@@ -107,39 +110,44 @@ Returns a JSON array of all available sessions:
     "session_id": "a1b2c3d4-...",
     "initial_task": "Refactor the auth module...",
     "created_at": "2025-01-15T10:30:00+00:00",
-    "message_count": 42,
-    "has_errors": false
+    "status": "completed",
+    "interactive": true,
+    "pid": 12345
   }
 ]
 ```
 
 ### `cline://sessions/{session_id}/chat`
 
-Returns a cleaned-up chat log for a specific session:
+Returns the full message history for a specific session:
 
 ```json
 {
   "session_id": "a1b2c3d4-...",
   "messages": [
-    {"role": "user", "text": "Refactor the auth module..."},
-    {"role": "assistant", "text": "Here is the refactored code..."}
+    {
+      "role": "user",
+      "text": "Refactor the auth module..."
+    },
+    {
+      "role": "assistant",
+      "text": "I'll refactor the auth module..."
+    }
   ]
 }
 ```
 
 ### `cline://agent/status`
 
-Returns the current execution state of the Cline CLI worker manager:
+Returns the aggregate status of all tracked Cline CLI processes:
 
 ```json
 {
   "status": "RUNNING",
-  "active_processes": 1,
-  "pids": [12345]
+  "active_processes": 2,
+  "pids": [51944, 52001]
 }
 ```
-
-Possible status values: `IDLE`, `RUNNING`, `AWAITING_INPUT`, `FAILED`.
 
 ---
 
@@ -147,41 +155,51 @@ Possible status values: `IDLE`, `RUNNING`, `AWAITING_INPUT`, `FAILED`.
 
 ### `list_cline_sessions`
 
-**Description:** Fast lookup to get a parsed JSON array of all local Cline sessions,
-sorted by timestamp (newest first).
-
-**Parameters:** None.
+**Description:** Lists all Cline CLI sessions sorted by newest first.
 
 ```json
 // Input
 {}
 
 // Output
-[{"session_id": "uuid", "initial_task": "...", ...}]
+[
+  {
+    "session_id": "session_1794143655625_7idx7",
+    "initial_task": "Fix the Cline CLI integration...",
+    "created_at": "2026-11-08T13:14:15.681Z",
+    "status": "running",
+    "interactive": true,
+    "pid": 51944
+  }
+]
 ```
 
 ### `command_cline_agent`
 
-**Description:** Starts a new Cline task or resumes an existing one asynchronously
-without blocking the MCP stdio pipe.
+**Description:** Start a new Cline CLI task or resume an existing one.
 
 **Parameters:**
 
-| Name               | Type   | Required | Description                           |
-|--------------------|--------|----------|---------------------------------------|
-| `prompt`           | string | Yes      | The prompt or instructions for Cline.   |
-| `resume_session_id`| string | No       | Session ID to resume.                 |
+| Name                | Type   | Required | Description                                            |
+|---------------------|--------|----------|--------------------------------------------------------|
+| `prompt`            | string | Yes      | The prompt/instructions to pass to Cline.               |
+| `resume_session_id` | string | No       | Session ID to resume. If provided, continues that session. |
 
 ```json
-// Input
-{
-  "prompt": "Analyze the performance of the database module",
-  "resume_session_id": "a1b2c3d4-..."
-}
+// New session
+{ "prompt": "Refactor the auth module" }
 
-// Output
+// Resume session
+{ "prompt": "Continue the refactoring", "resume_session_id": "session_1794143655625_7idx7" }
+```
+
+The server uses `cline --id <sid> "prompt"` to resume and `cline "prompt"` for new sessions.
+
+**Output:**
+
+```json
 {
-  "pid": 12345,
+  "pid": 51944,
   "status": "spawning",
   "prompt_length": 42
 }
@@ -206,6 +224,7 @@ finished.
 {
   "pid": 12345,
   "alive": true,
+  "started_at": "2026-11-08T13:14:15.681Z",
   "runtime_seconds": 15.3,
   "stdout_excerpt": "...",
   "stderr_excerpt": "...",
@@ -242,43 +261,21 @@ escalates to `SIGKILL` after 0.5s if the process does not respond.
 
 There are two supported ways to embed this MCP server in Hermes Agent configuration.
 
-### Option A: `mcp_settings.json`
+### Option A: `config.yaml` (preferred)
 
-Create or edit `~/.hermes/mcp_settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "cline-hermes-bridge": {
-      "command": "python",
-      "args": ["/Users/wgorter/Development/cline-hermes-bridge/server.py"],
-      "env": {},
-      "disabled": false,
-      "timeout": 300
-    }
-  }
-}
-```
-
-> **Windows path example:**
-> ```json
-> "args": ["C:\\Path\\To\\cline-hermes-bridge\\server.py"]
-> ```
-
-### Option B: `mcp_settings.yaml`
+Edit `~/.hermes/config.yaml`:
 
 ```yaml
-mcpServers:
-  cline-hermes-bridge:
-    command: python
-    args:
-      - /Users/wgorter/Development/cline-hermes-bridge/server.py
-    env: {}
-    disabled: false
-    timeout: 300
+cline-hermes-bridge:
+  command: python
+  args:
+    - /Users/wgorter/Development/cline-hermes-bridge/server.py
+  env: {}
+  disabled: false
+  timeout: 300
 ```
 
-### Option C: Environment Variable for Custom History Path
+### Option B: Environment Variable for Custom History Path
 
 ```bash
 export CLINE_HISTORY_DIR="/custom/path/to/cline/history"
@@ -298,11 +295,11 @@ The server gracefully handles the following edge cases:
 
 | Scenario                        | Behavior                                              |
 |--------------------------------|-------------------------------------------------------|
-| `history/` directory missing   | Returns `[]` for session lists; no crash.              |
-| Corrupted / unreadable JSON    | Skips the file, logs silently.                       |
-| `cline` CLI not in PATH        | Returns a structured JSON error from `command_cline_agent`. |
-| Process not tracked by `pid`   | Returns `"error": "Process not tracked"` from `get_agent_runtime_status`. |
-| Kill command fails             | Returns `"killed": false` with the exception message.  |
+| `sessions/` directory missing   | Returns `[]` for session lists; no crash.              |
+| Corrupted / unreadable JSON     | Skips the file, logs silently.                       |
+| `cline` CLI not in PATH         | Returns a structured JSON error from `command_cline_agent`. |
+| Process not tracked by `pid`    | Returns `"error": "Process not tracked"` from `get_agent_runtime_status`. |
+| Kill command fails              | Returns `"killed": false` with the exception message.  |
 
 All errors are returned as **structured JSON** inside the MCP `TextContent` envelope.
 
