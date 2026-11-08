@@ -1,0 +1,7 @@
+cline-hermes-bridge:
+  command: python
+  args:
+    - /path/to/cline-hermes-bridge/server.py
+  env: {}
+  disabled: false
+  timeout: 300

@@ -27,7 +27,7 @@
 [Hermes Agent]
      │
      ▼  (JSON-RPC 2.0 over stdio)
-[cine-hermes-bridge MCP Server]
+[cline-hermes-bridge MCP Server]
      │
      ├─► Reads Cline session JSON files from local history
      ├─► Spawns / monitors / kills `cline` CLI subprocesses
@@ -269,7 +269,7 @@ Edit `~/.hermes/config.yaml`:
 cline-hermes-bridge:
   command: python
   args:
-    - /Users/wgorter/Development/cline-hermes-bridge/server.py
+    - /path/to/cline-hermes-bridge/server.py
   env: {}
   disabled: false
   timeout: 300
