@@ -93,7 +93,6 @@ def _parse_filename_session_id(filename: str) -> Optional[str]:
     """Extract session ID from a filename like '<uuid>.json' or 'session_<uuid>.json'."""
     name = Path(filename).stem
     # Try direct UUID, then prefix patterns
-    import uuid as _uuid_mod
     for pattern in [
         r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         r"^session_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
