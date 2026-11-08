@@ -40,20 +40,16 @@ async def _read_json_file_safe(path: Path) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Cline history path resolution
+# Cline history path resolution (CLI sessions: ~/.cline/data/sessions)
 # ---------------------------------------------------------------------------
-
-HISTORY_SUBPATH = "User/globalStorage/saoudrizwan.claude-dev/history"
-
-ROOTS: Dict[str, str] = {
-    "darwin": "Library/Application Support",
-    "win32": r"AppData\Roaming",
-    "linux": ".config",
-}
 
 
 def resolve_cline_history_dir() -> Path:
-    """Return the Cline session-history directory for the current OS.
+    """Return the Cline CLI sessions directory for the current OS.
+
+    Cline CLI stores each session as a directory under ~/.cline/data/sessions/.
+    Each session directory contains a <session_id>.json metadata file and
+    a <session_id>.messages.json file.
 
     Supports overriding via CLINE_HISTORY_DIR environment variable.
     """
@@ -62,14 +58,9 @@ def resolve_cline_history_dir() -> Path:
         return Path(override)
 
     system = platform.system().lower()
-    root_env = "APPDATA" if system == "win32" else "HOME"
-    base = Path(os.environ.get(root_env, str(Path.home())))
-
-    if system == "darwin":
-        return base / ROOTS["darwin"] / HISTORY_SUBPATH
     if system == "win32":
-        return base / ROOTS["win32"] / HISTORY_SUBPATH
-    return base / ROOTS["linux"] / HISTORY_SUBPATH
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / ".cline" / "data" / "sessions"
+    return Path(os.environ.get("HOME", str(Path.home()))) / ".cline" / "data" / "sessions"
 
 
 # ---------------------------------------------------------------------------
@@ -110,50 +101,54 @@ def _parse_filename_session_id(filename: str) -> Optional[str]:
 
 
 async def _build_session_index(history_dir: Path) -> List[Dict[str, Any]]:
-    """Walk history_dir and return a list of session dicts sorted newest-first."""
+    """Walk Cline CLI session directories and return session summaries sorted newest-first.
+
+    Each session is a directory (e.g. ``1794141752666_nnmuu``) containing
+    ``<session_id>.json`` (metadata) and ``<session_id>.messages.json`` (chat log).
+    """
     summaries: List[Dict[str, Any]] = []
     if not history_dir.is_dir():
         return summaries
 
-    files = [f for f in history_dir.iterdir() if f.suffix == ".json"]
+    # Each session is a directory; metadata is <session_id>.json inside it.
+    for session_dir in sorted(history_dir.iterdir(), reverse=True):
+        if not session_dir.is_dir():
+            continue
+        meta_path = session_dir / f"{session_dir.name}.json"
+        if not meta_path.is_file():
+            continue
 
-    for fp in files:
-        session = await _read_json_file_safe(fp)
+        session = await _read_json_file_safe(meta_path)
         if session is None:
             continue
-        sid = _parse_filename_session_id(fp.name)
-        if sid is None:
-            sid = fp.stem
 
-        created = session.get("createdAt", session.get("timestamp", ""))
-        if isinstance(created, (int, float)):
-            try:
-                created = datetime.fromtimestamp(
-                    created, tz=timezone.utc
-                ).isoformat()
-            except (ValueError, OSError):
-                created = ""
+        sid = session.get("session_id", session_dir.name)
+        if not sid:
+            sid = session_dir.name
 
-        initial_task = _extract_initial_task(session)
+        created_at = session.get("started_at", "")
+        if not created_at:
+            created_at = session.get("ended_at", "")
 
-        msg_count = 0
-        err_flag = False
-        for m in session.get("messages", session.get("history", [])):
-            role = m.get("role", "")
-            if role in ("user", "human"):
-                msg_count += 1
-            if m.get("error") or m.get("isError"):
-                err_flag = True
+        prompt = session.get("prompt", "")
+        if isinstance(prompt, str):
+            prompt = prompt.strip()[:200]
+        else:
+            prompt = ""
+
+        status = session.get("status", "unknown")
+        interactive = session.get("interactive", False)
+        pid = session.get("pid")
 
         summaries.append({
             "session_id": sid,
-            "initial_task": initial_task,
-            "created_at": str(created),
-            "message_count": msg_count,
-            "has_errors": err_flag,
+            "initial_task": prompt,
+            "created_at": str(created_at),
+            "status": status,
+            "interactive": interactive,
+            "pid": pid,
         })
 
-    summaries.sort(key=lambda s: s.get("created_at", ""), reverse=True)
     return summaries
 
 
@@ -188,8 +183,8 @@ def _create_server() -> Server:
         params is a CallToolRequestParams with .name (str) and
         .arguments (dict or None).
         """
-        name = params.name  # type: ignore[union-attr]
-        arguments = params.arguments or {}  # type: ignore[union-attr]
+        name = params.name
+        arguments = params.arguments or {}
 
         if name == "list_cline_sessions":
             try:
@@ -272,8 +267,8 @@ def _create_server() -> Server:
                 "name": "list_cline_sessions",
                 "title": "list_cline_sessions",
                 "description": (
-                    "List all local Cline sessions sorted by newest first. "
-                    "Returns session metadata."
+                    "List all local Cline CLI sessions sorted by newest first. "
+                    "Returns session metadata including initial prompt, status, and PID."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -285,7 +280,7 @@ def _create_server() -> Server:
                 "name": "command_cline_agent",
                 "title": "command_cline_agent",
                 "description": (
-                    "Start a new Cline task or resume an existing one "
+                    "Start a new Cline CLI task or resume an existing one "
                     "asynchronously. Returns the PID for status tracking."
                 ),
                 "inputSchema": {
@@ -363,7 +358,7 @@ def _create_server() -> Server:
 
         params is a ReadResourceRequestParams with attribute .uri.
         """
-        uri = params.uri  # type: ignore[union-attr]
+        uri = params.uri
 
         if uri == "cline://sessions":
             result = await _build_session_index(resolve_cline_history_dir())
@@ -377,19 +372,11 @@ def _create_server() -> Server:
             session_id = m.group(1)
             history = resolve_cline_history_dir()
 
+            # The CLI stores each session in a directory:
+            # ~/.cline/data/sessions/<session_id>/<session_id>.messages.json
             session = await _read_json_file_safe(
-                history / f"{session_id}.json")
-            if session is None:
-                for candidate in [
-                    f"chat_{session_id}.json",
-                    f"session_{session_id}.json",
-                ]:
-                    alt = history / candidate
-                    if alt.exists():
-                        session = await _read_json_file_safe(alt)
-                        if session is not None:
-                            break
-
+                history / session_id / f"{session_id}.messages.json"
+            )
             if session is None:
                 return [TextContent(
                     type="text",
@@ -398,7 +385,7 @@ def _create_server() -> Server:
                     })
                 )]
 
-            messages = session.get("messages", session.get("history", []))
+            messages = session if isinstance(session, list) else session.get("messages", [])
             chat_log: List[Dict[str, str]] = []
             for msg in messages:
                 role = msg.get("role", "unknown")
@@ -453,7 +440,7 @@ def _create_server() -> Server:
         name="cline-hermes-bridge",
         version="1.0.0",
         description=(
-            "MCP bridge exposing Cline session history and process "
+            "MCP bridge exposing Cline CLI session history and process "
             "control. Allows Hermes Agent to monitor and manage Cline "
             "CLI workers."
         ),
@@ -501,11 +488,16 @@ async def _spawn_cline_task(
     prompt: str,
     resume_session_id: Optional[str] = None,
 ) -> int:
-    """Spawn ``cline new`` or ``cline resume`` via asyncio; track PID."""
+    """Spawn a Cline CLI task and track its PID.
+
+    Non-interactive CLI usage:
+      cline "prompt"            start a new session
+      cline --id <sid> "prompt" resume a session
+    """
     if resume_session_id:
-        cmd = ["cline", "resume", resume_session_id, "--prompt", prompt]
+        cmd = ["cline", "--id", resume_session_id, prompt]
     else:
-        cmd = ["cline", "new", prompt]
+        cmd = ["cline", prompt]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -520,6 +512,8 @@ async def _spawn_cline_task(
         "stdout_buf": "",
         "stderr_buf": "",
         "return_code": None,
+        "prompt": prompt,
+        "resume_session_id": resume_session_id,
     }
     async with _RUNTIME_LOCK:
         _RUNTIME[proc.pid] = entry
